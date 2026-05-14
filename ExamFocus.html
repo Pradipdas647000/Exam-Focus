@@ -109,6 +109,26 @@
   .upload-area input{display:none;}
   .upload-text{font-size:13px;color:var(--muted);}
   .upload-text span{color:var(--accent);font-weight:500;}
+  .upload-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;}
+
+  /* IMAGE GALLERY */
+  .img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:12px;}
+  .img-thumb{position:relative;border-radius:10px;overflow:hidden;aspect-ratio:1;cursor:pointer;border:1px solid var(--border);transition:border 0.2s,transform 0.2s;}
+  .img-thumb:hover{border-color:var(--accent);transform:scale(1.03);}
+  .img-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
+  .img-thumb-overlay{position:absolute;inset:0;background:linear-gradient(transparent 50%,rgba(0,0,0,0.7));opacity:0;transition:opacity 0.2s;display:flex;align-items:flex-end;justify-content:space-between;padding:8px;}
+  .img-thumb:hover .img-thumb-overlay{opacity:1;}
+  .img-thumb-name{font-size:10px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%;}
+  .img-del-btn{background:rgba(239,68,68,0.85);border:none;color:#fff;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;transition:background 0.2s;flex-shrink:0;}
+  .img-del-btn:hover{background:#ef4444;}
+
+  /* LIGHTBOX */
+  .lightbox{position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:10000;display:none;align-items:center;justify-content:center;flex-direction:column;backdrop-filter:blur(8px);}
+  .lightbox.open{display:flex;}
+  .lightbox img{max-width:90vw;max-height:80vh;border-radius:12px;box-shadow:0 12px 48px rgba(0,0,0,0.6);}
+  .lightbox-close{position:absolute;top:20px;right:24px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);color:#fff;width:40px;height:40px;border-radius:50%;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.2s;}
+  .lightbox-close:hover{background:rgba(255,255,255,0.2);}
+  .lightbox-name{color:var(--muted);font-size:13px;margin-top:14px;}
 
   /* POMODORO */
   .pomodoro-wrap{display:flex;flex-direction:column;align-items:center;padding:20px 0;}
@@ -221,7 +241,7 @@
   <!-- PAGE 2: STUDY MATERIAL -->
   <div id="page-study" class="page">
     <div class="page-title">Study Material</div>
-    <div class="page-subtitle">Upload PDFs for each exam. Files are stored in your browser.</div>
+    <div class="page-subtitle">Upload PDFs and images for each exam. Files are stored in your browser.</div>
     <div id="study-container"></div>
   </div>
 
@@ -278,11 +298,19 @@
 
 </div>
 
+<!-- LIGHTBOX -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox(event)">
+  <button class="lightbox-close" onclick="closeLightbox()">✕</button>
+  <img id="lightbox-img" src="" alt="">
+  <div class="lightbox-name" id="lightbox-name"></div>
+</div>
+
 <script>
 // ---- STATE ----
 let exams = [];
 let notes = {};
 let pdfs = {}; // { examId: [{ name, size, addedAt, key }] } — metadata only, blobs in IndexedDB
+let images = {}; // { examId: [{ name, size, addedAt, key }] } — metadata only, blobs in IndexedDB
 let pomoCycles = 0;
 let pomoMinutes = 0;
 let pomoMode = 'study';
@@ -298,13 +326,16 @@ const PDFDB = {
   _db: null,
   DB_NAME: 'examfocus_pdfs',
   STORE: 'pdfs',
+  IMG_STORE: 'images',
 
   open() {
     return new Promise((resolve, reject) => {
       if (this._db) { resolve(this._db); return; }
-      const req = indexedDB.open(this.DB_NAME, 1);
+      const req = indexedDB.open(this.DB_NAME, 2);
       req.onupgradeneeded = (e) => {
-        e.target.result.createObjectStore(this.STORE);
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(this.STORE)) db.createObjectStore(this.STORE);
+        if (!db.objectStoreNames.contains(this.IMG_STORE)) db.createObjectStore(this.IMG_STORE);
       };
       req.onsuccess = (e) => { this._db = e.target.result; resolve(this._db); };
       req.onerror = (e) => reject(e.target.error);
@@ -339,6 +370,36 @@ const PDFDB = {
       tx.oncomplete = () => resolve();
       tx.onerror = (e) => reject(e.target.error);
     });
+  },
+
+  async putImg(key, blob) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.IMG_STORE, 'readwrite');
+      tx.objectStore(this.IMG_STORE).put(blob, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (e) => reject(e.target.error);
+    });
+  },
+
+  async getImg(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.IMG_STORE, 'readonly');
+      const req = tx.objectStore(this.IMG_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+
+  async deleteImg(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.IMG_STORE, 'readwrite');
+      tx.objectStore(this.IMG_STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (e) => reject(e.target.error);
+    });
   }
 };
 
@@ -352,6 +413,7 @@ async function init() {
       exams = d.exams || [];
       notes = d.notes || {};
       pdfs = d.pdfs || {};
+      images = d.images || {};
       pomoCycles = d.pomoCycles || 0;
       pomoMinutes = d.pomoMinutes || 0;
       const today = new Date().toDateString();
@@ -377,9 +439,8 @@ async function init() {
 }
 
 function save() {
-  // PDF metadata (name, size, key) in localStorage; actual PDF blobs in IndexedDB
   localStorage.setItem('examfocus_v3', JSON.stringify({
-    exams, notes, pdfs, pomoCycles, pomoMinutes,
+    exams, notes, pdfs, images, pomoCycles, pomoMinutes,
     pomoDate: new Date().toDateString()
   }));
 }
@@ -410,14 +471,14 @@ function addExam() {
 }
 
 async function deleteExam(id) {
-  // Remove PDF blobs from IndexedDB
   const examPdfs = pdfs[id] || [];
-  for (const p of examPdfs) {
-    if (p.key) await PDFDB.delete(p.key);
-  }
+  for (const p of examPdfs) { if (p.key) await PDFDB.delete(p.key); }
+  const examImgs = images[id] || [];
+  for (const img of examImgs) { if (img.key) await PDFDB.deleteImg(img.key); }
   exams = exams.filter(e => e.id !== id);
   delete notes[id];
   delete pdfs[id];
+  delete images[id];
   save();
   renderExams();
 }
@@ -488,6 +549,7 @@ function renderStudy() {
     return;
   }
   c.innerHTML = exams.map(e => studySectionHTML(e)).join('');
+  loadImageThumbnails();
 }
 
 function studySectionHTML(e) {
@@ -499,21 +561,31 @@ function studySectionHTML(e) {
         <button class="btn btn-sm btn-danger" onclick="deletePDF('${e.id}',${i})">✕</button>
       </div>
     </div>`).join('');
+  const imgCount = (images[e.id] || []).length;
   const badgeClass = { high:'badge-high', medium:'badge-medium', low:'badge-low' }[e.priority];
   const badgeLabel = { high:'🔴 High', medium:'🟡 Medium', low:'🟢 Low' }[e.priority];
-  const count = (pdfs[e.id] || []).length;
+  const pdfCount = (pdfs[e.id] || []).length;
+  const totalCount = pdfCount + imgCount;
   return `
     <div class="exam-section">
       <div class="exam-section-header">
-        <div class="exam-section-title">${esc(e.name)} <span style="font-size:12px;color:var(--muted);font-family:'Inter',sans-serif;font-weight:400;">${count} file${count!==1?'s':''}</span></div>
+        <div class="exam-section-title">${esc(e.name)} <span style="font-size:12px;color:var(--muted);font-family:'Inter',sans-serif;font-weight:400;">${totalCount} file${totalCount!==1?'s':''}</span></div>
         <span class="badge ${badgeClass}">${badgeLabel}</span>
       </div>
       <div class="card2">
         <div class="pdf-list" id="pdf-list-${e.id}">${pList || '<div style="color:var(--muted);font-size:13px;padding:4px 0;">No PDFs uploaded yet.</div>'}</div>
-        <label class="upload-area">
-          <input type="file" accept=".pdf" multiple onchange="handleUpload(event,'${e.id}')">
-          <div class="upload-text">📎 <span>Click to upload PDF</span> — stored in browser, opens instantly</div>
-        </label>
+        <div class="img-grid" id="img-grid-${e.id}"></div>
+        ${imgCount === 0 ? '<div style="color:var(--muted);font-size:13px;padding:4px 0 10px;">No images uploaded yet.</div>' : ''}
+        <div class="upload-row">
+          <label class="upload-area">
+            <input type="file" accept=".pdf" multiple onchange="handleUpload(event,'${e.id}')">
+            <div class="upload-text">📎 <span>Upload PDF</span></div>
+          </label>
+          <label class="upload-area">
+            <input type="file" accept="image/*" multiple onchange="handleImageUpload(event,'${e.id}')">
+            <div class="upload-text">🖼️ <span>Upload Image</span></div>
+          </label>
+        </div>
       </div>
     </div>`;
 }
@@ -558,10 +630,93 @@ async function openPDF(examId, idx) {
 
 async function deletePDF(examId, idx) {
   const p = (pdfs[examId] || [])[idx];
-  if (p && p.key) await PDFDB.delete(p.key);
+  if (!p) return;
+  if (p.key) await PDFDB.delete(p.key);
   pdfs[examId].splice(idx, 1);
   save(); renderStudy();
   showToast('🗑️ PDF removed');
+}
+
+// ---- IMAGE HANDLING ----
+async function handleImageUpload(event, examId) {
+  const files = Array.from(event.target.files);
+  if (!images[examId]) images[examId] = [];
+  let added = 0;
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue;
+    const exists = images[examId].some(img => img.name === file.name);
+    if (exists) continue;
+    const key = 'img_' + examId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    try {
+      await PDFDB.putImg(key, file);
+      images[examId].push({ name: file.name, size: file.size, addedAt: Date.now(), key });
+      added++;
+    } catch(e) {
+      showToast('⚠️ Storage error — try removing old files');
+      break;
+    }
+  }
+  save();
+  renderStudy();
+  if (added > 0) showToast(`🖼️ ${added} image${added!==1?'s':''} uploaded successfully`);
+  else showToast(`⚠️ Image${files.length!==1?'s':''} already uploaded or invalid`);
+}
+
+async function loadImageThumbnails() {
+  for (const e of exams) {
+    const grid = document.getElementById('img-grid-' + e.id);
+    if (!grid) continue;
+    const imgs = images[e.id] || [];
+    if (imgs.length === 0) { grid.innerHTML = ''; continue; }
+    let html = '';
+    for (let i = 0; i < imgs.length; i++) {
+      const img = imgs[i];
+      try {
+        const blob = await PDFDB.getImg(img.key);
+        if (!blob) continue;
+        const url = URL.createObjectURL(blob);
+        html += `<div class="img-thumb" onclick="viewImage('${e.id}',${i})">
+          <img src="${url}" alt="${esc(img.name)}" loading="lazy">
+          <div class="img-thumb-overlay">
+            <span class="img-thumb-name">${esc(img.name)}</span>
+            <button class="img-del-btn" onclick="event.stopPropagation();deleteImage('${e.id}',${i})" title="Delete">✕</button>
+          </div>
+        </div>`;
+      } catch(err) {}
+    }
+    grid.innerHTML = html;
+  }
+}
+
+async function viewImage(examId, idx) {
+  const img = (images[examId] || [])[idx];
+  if (!img || !img.key) { showToast('⚠️ Image not found'); return; }
+  try {
+    const blob = await PDFDB.getImg(img.key);
+    if (!blob) { showToast('⚠️ Image not found in storage'); return; }
+    const url = URL.createObjectURL(blob);
+    document.getElementById('lightbox-img').src = url;
+    document.getElementById('lightbox-name').textContent = img.name;
+    document.getElementById('lightbox').classList.add('open');
+    document.getElementById('lightbox')._revokeUrl = url;
+  } catch(e) { showToast('⚠️ Error opening image'); }
+}
+
+function closeLightbox(e) {
+  if (e && e.target !== e.currentTarget && !e.target.classList.contains('lightbox-close')) return;
+  const lb = document.getElementById('lightbox');
+  lb.classList.remove('open');
+  if (lb._revokeUrl) { URL.revokeObjectURL(lb._revokeUrl); lb._revokeUrl = null; }
+  document.getElementById('lightbox-img').src = '';
+}
+
+async function deleteImage(examId, idx) {
+  const img = (images[examId] || [])[idx];
+  if (!img) return;
+  if (img.key) await PDFDB.deleteImg(img.key);
+  images[examId].splice(idx, 1);
+  save(); renderStudy();
+  showToast('🗑️ Image removed');
 }
 
 function formatSize(bytes) {
