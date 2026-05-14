@@ -282,7 +282,7 @@
 // ---- STATE ----
 let exams = [];
 let notes = {};
-let pdfs = {};
+let pdfs = {}; // { examId: [{ name, size, addedAt, key }] } — metadata only, blobs in IndexedDB
 let pomoCycles = 0;
 let pomoMinutes = 0;
 let pomoMode = 'study';
@@ -293,9 +293,59 @@ const STUDY_TIME = 25 * 60;
 const BREAK_TIME = 5 * 60;
 const RING_CIRCUMFERENCE = 2 * Math.PI * 106;
 
+// ---- IndexedDB for PDF Storage ----
+const PDFDB = {
+  _db: null,
+  DB_NAME: 'examfocus_pdfs',
+  STORE: 'pdfs',
+
+  open() {
+    return new Promise((resolve, reject) => {
+      if (this._db) { resolve(this._db); return; }
+      const req = indexedDB.open(this.DB_NAME, 1);
+      req.onupgradeneeded = (e) => {
+        e.target.result.createObjectStore(this.STORE);
+      };
+      req.onsuccess = (e) => { this._db = e.target.result; resolve(this._db); };
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+
+  async put(key, blob) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.STORE, 'readwrite');
+      tx.objectStore(this.STORE).put(blob, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (e) => reject(e.target.error);
+    });
+  },
+
+  async get(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.STORE, 'readonly');
+      const req = tx.objectStore(this.STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+
+  async delete(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.STORE, 'readwrite');
+      tx.objectStore(this.STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (e) => reject(e.target.error);
+    });
+  }
+};
+
 // ---- INIT ----
-function init() {
-  const saved = localStorage.getItem('examfocus_v2');
+async function init() {
+  await PDFDB.open();
+  const saved = localStorage.getItem('examfocus_v3');
   if (saved) {
     try {
       const d = JSON.parse(saved);
@@ -304,18 +354,31 @@ function init() {
       pdfs = d.pdfs || {};
       pomoCycles = d.pomoCycles || 0;
       pomoMinutes = d.pomoMinutes || 0;
-      // Reset cycles/minutes if different day
       const today = new Date().toDateString();
       if (d.pomoDate !== today) { pomoCycles = 0; pomoMinutes = 0; }
     } catch(e) {}
+  } else {
+    // Migrate from v2 if exists
+    const old = localStorage.getItem('examfocus_v2');
+    if (old) {
+      try {
+        const d = JSON.parse(old);
+        exams = d.exams || [];
+        notes = d.notes || {};
+        pdfs = {}; // old pdfs had data embedded, clear them
+        pomoCycles = d.pomoCycles || 0;
+        pomoMinutes = d.pomoMinutes || 0;
+      } catch(e) {}
+      save();
+    }
   }
   renderExams();
   startCountdownLoop();
 }
 
 function save() {
-  // Only names/metadata stored — no file data — so localStorage will never fill up
-  localStorage.setItem('examfocus_v2', JSON.stringify({
+  // PDF metadata (name, size, key) in localStorage; actual PDF blobs in IndexedDB
+  localStorage.setItem('examfocus_v3', JSON.stringify({
     exams, notes, pdfs, pomoCycles, pomoMinutes,
     pomoDate: new Date().toDateString()
   }));
@@ -346,7 +409,12 @@ function addExam() {
   document.getElementById('exam-datetime').value = '';
 }
 
-function deleteExam(id) {
+async function deleteExam(id) {
+  // Remove PDF blobs from IndexedDB
+  const examPdfs = pdfs[id] || [];
+  for (const p of examPdfs) {
+    if (p.key) await PDFDB.delete(p.key);
+  }
   exams = exams.filter(e => e.id !== id);
   delete notes[id];
   delete pdfs[id];
@@ -427,7 +495,7 @@ function studySectionHTML(e) {
     <div class="pdf-item">
       <div class="pdf-name"><span class="pdf-icon">📕</span>${esc(p.name)}<span class="pdf-size">${p.size ? formatSize(p.size) : ''}</span></div>
       <div class="pdf-actions">
-        <button class="btn btn-sm btn-primary" onclick="openPDFInBrowser('${e.id}',${i})" title="Select and open in browser">▶ Open</button>
+        <button class="btn btn-sm btn-primary" onclick="openPDF('${e.id}',${i})" title="Open in browser">▶ Open</button>
         <button class="btn btn-sm btn-danger" onclick="deletePDF('${e.id}',${i})">✕</button>
       </div>
     </div>`).join('');
@@ -441,57 +509,59 @@ function studySectionHTML(e) {
         <span class="badge ${badgeClass}">${badgeLabel}</span>
       </div>
       <div class="card2">
-        <div class="pdf-list" id="pdf-list-${e.id}">${pList || '<div style="color:var(--muted);font-size:13px;padding:4px 0;">No PDFs linked yet.</div>'}</div>
+        <div class="pdf-list" id="pdf-list-${e.id}">${pList || '<div style="color:var(--muted);font-size:13px;padding:4px 0;">No PDFs uploaded yet.</div>'}</div>
         <label class="upload-area">
           <input type="file" accept=".pdf" multiple onchange="handleUpload(event,'${e.id}')">
-          <div class="upload-text">📎 <span>Click to link PDF files</span> — only names are saved, files stay on your device</div>
+          <div class="upload-text">📎 <span>Click to upload PDF</span> — stored in browser, opens instantly</div>
         </label>
       </div>
     </div>`;
 }
 
-function handleUpload(event, examId) {
+async function handleUpload(event, examId) {
   const files = Array.from(event.target.files);
   if (!pdfs[examId]) pdfs[examId] = [];
-  files.forEach(file => {
-    // Only save file name and size — no file data stored
-    const alreadyLinked = pdfs[examId].some(p => p.name === file.name);
-    if (!alreadyLinked) {
-      pdfs[examId].push({ name: file.name, size: file.size, addedAt: Date.now() });
+  let added = 0;
+  for (const file of files) {
+    const alreadyExists = pdfs[examId].some(p => p.name === file.name);
+    if (alreadyExists) continue;
+    const key = examId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    try {
+      await PDFDB.put(key, file);
+      pdfs[examId].push({ name: file.name, size: file.size, addedAt: Date.now(), key });
+      added++;
+    } catch(e) {
+      showToast('⚠️ Storage error — try removing old PDFs');
+      break;
     }
-  });
+  }
   save();
   renderStudy();
-  const count = files.length;
-  showToast(`📎 ${count} file${count!==1?'s':''} linked successfully`);
+  if (added > 0) showToast(`📎 ${added} PDF${added!==1?'s':''} uploaded successfully`);
+  else showToast(`⚠️ File${files.length!==1?'s':''} already uploaded`);
 }
 
-function openPDFInBrowser(examId, idx) {
+async function openPDF(examId, idx) {
   const p = (pdfs[examId] || [])[idx];
-  if (!p) return;
-  // Create a hidden file input to let user pick the PDF, then open it in browser
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = '.pdf';
-  input.style.display = 'none';
-  input.onchange = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
+  if (!p || !p.key) { showToast('⚠️ PDF data not found'); return; }
+  try {
+    const blob = await PDFDB.get(p.key);
+    if (!blob) { showToast('⚠️ PDF not found in storage. Please re-upload.'); return; }
+    const url = URL.createObjectURL(blob);
     window.open(url, '_blank');
-    showToast(`📄 Opened "${file.name}" in browser`);
-    // Clean up after a delay
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-    input.remove();
-  };
-  document.body.appendChild(input);
-  showToast(`📂 Select "${p.name}" from your device to open`);
-  input.click();
+    showToast(`📄 Opened "${p.name}"`);
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  } catch(e) {
+    showToast('⚠️ Error opening PDF');
+  }
 }
 
-function deletePDF(examId, idx) {
+async function deletePDF(examId, idx) {
+  const p = (pdfs[examId] || [])[idx];
+  if (p && p.key) await PDFDB.delete(p.key);
   pdfs[examId].splice(idx, 1);
   save(); renderStudy();
+  showToast('🗑️ PDF removed');
 }
 
 function formatSize(bytes) {
