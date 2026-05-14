@@ -89,6 +89,12 @@
   .empty-state h3{font-size:16px;margin-bottom:6px;color:var(--muted);}
   .empty-state p{font-size:13px;}
 
+  /* TOAST */
+  .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:14px 24px;font-size:13px;z-index:9999;opacity:0;transition:all 0.35s cubic-bezier(0.4,0,0.2,1);pointer-events:none;box-shadow:0 8px 32px rgba(0,0,0,0.4);display:flex;align-items:center;gap:10px;}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+  .toast-icon{font-size:18px;}
+  .pdf-size{font-size:11px;color:var(--muted);margin-left:4px;}
+
   /* PDF PAGE */
   .exam-section{margin-bottom:28px;}
   .exam-section-header{display:flex;align-items:center;gap:12px;margin-bottom:14px;}
@@ -308,14 +314,11 @@ function init() {
 }
 
 function save() {
-  try {
-    localStorage.setItem('examfocus_v2', JSON.stringify({
-      exams, notes, pdfs, pomoCycles, pomoMinutes,
-      pomoDate: new Date().toDateString()
-    }));
-  } catch(e) {
-    alert('Storage full! Some PDFs may not be saved. Try removing old PDFs.');
-  }
+  // Only names/metadata stored — no file data — so localStorage will never fill up
+  localStorage.setItem('examfocus_v2', JSON.stringify({
+    exams, notes, pdfs, pomoCycles, pomoMinutes,
+    pomoDate: new Date().toDateString()
+  }));
 }
 
 // ---- NAVIGATION ----
@@ -422,25 +425,26 @@ function renderStudy() {
 function studySectionHTML(e) {
   const pList = (pdfs[e.id] || []).map((p,i) => `
     <div class="pdf-item">
-      <div class="pdf-name"><span class="pdf-icon">📕</span>${esc(p.name)}</div>
+      <div class="pdf-name"><span class="pdf-icon">📕</span>${esc(p.name)}<span class="pdf-size">${p.size ? formatSize(p.size) : ''}</span></div>
       <div class="pdf-actions">
-        <button class="btn btn-sm btn-ghost" onclick="openPDF('${e.id}',${i})">Open</button>
+        <button class="btn btn-sm btn-ghost" onclick="openPDF('${e.id}',${i})" title="Open from your device">📂 Locate</button>
         <button class="btn btn-sm btn-danger" onclick="deletePDF('${e.id}',${i})">✕</button>
       </div>
     </div>`).join('');
   const badgeClass = { high:'badge-high', medium:'badge-medium', low:'badge-low' }[e.priority];
   const badgeLabel = { high:'🔴 High', medium:'🟡 Medium', low:'🟢 Low' }[e.priority];
+  const count = (pdfs[e.id] || []).length;
   return `
     <div class="exam-section">
       <div class="exam-section-header">
-        <div class="exam-section-title">${esc(e.name)}</div>
+        <div class="exam-section-title">${esc(e.name)} <span style="font-size:12px;color:var(--muted);font-family:'Inter',sans-serif;font-weight:400;">${count} file${count!==1?'s':''}</span></div>
         <span class="badge ${badgeClass}">${badgeLabel}</span>
       </div>
       <div class="card2">
-        <div class="pdf-list" id="pdf-list-${e.id}">${pList || '<div style="color:var(--muted);font-size:13px;padding:4px 0;">No PDFs uploaded yet.</div>'}</div>
+        <div class="pdf-list" id="pdf-list-${e.id}">${pList || '<div style="color:var(--muted);font-size:13px;padding:4px 0;">No PDFs linked yet.</div>'}</div>
         <label class="upload-area">
           <input type="file" accept=".pdf" multiple onchange="handleUpload(event,'${e.id}')">
-          <div class="upload-text">📎 <span>Click to upload PDF</span> — files stored locally</div>
+          <div class="upload-text">📎 <span>Click to link PDF files</span> — only names are saved, files stay on your device</div>
         </label>
       </div>
     </div>`;
@@ -448,29 +452,51 @@ function studySectionHTML(e) {
 
 function handleUpload(event, examId) {
   const files = Array.from(event.target.files);
-  let loaded = 0;
+  if (!pdfs[examId]) pdfs[examId] = [];
   files.forEach(file => {
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      if (!pdfs[examId]) pdfs[examId] = [];
-      pdfs[examId].push({ name: file.name, data: ev.target.result });
-      loaded++;
-      if (loaded === files.length) { save(); renderStudy(); }
-    };
-    reader.readAsDataURL(file);
+    // Only save file name and size — no file data stored
+    const alreadyLinked = pdfs[examId].some(p => p.name === file.name);
+    if (!alreadyLinked) {
+      pdfs[examId].push({ name: file.name, size: file.size, addedAt: Date.now() });
+    }
   });
+  save();
+  renderStudy();
+  const count = files.length;
+  showToast(`📎 ${count} file${count!==1?'s':''} linked — open from your file manager`);
 }
 
 function openPDF(examId, idx) {
   const p = (pdfs[examId] || [])[idx];
   if (!p) return;
-  const win = window.open();
-  win.document.write(`<iframe src="${p.data}" style="width:100%;height:100%;border:none;" />`);
+  showToast(`📂 Open "${p.name}" from your device's file manager`);
 }
 
 function deletePDF(examId, idx) {
   pdfs[examId].splice(idx, 1);
   save(); renderStudy();
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+function showToast(msg) {
+  let t = document.getElementById('app-toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'app-toast';
+    t.className = 'toast';
+    document.body.appendChild(t);
+  }
+  t.innerHTML = msg;
+  t.classList.remove('show');
+  void t.offsetWidth; // reflow
+  t.classList.add('show');
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
 // ---- POMODORO ----
